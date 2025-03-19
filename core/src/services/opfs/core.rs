@@ -33,8 +33,8 @@
 // under the License.
 
 use crate::{Error, ErrorKind, Result};
+use js_sys::Uint8Array;
 use std::fmt::Debug;
-
 use web_sys::{
     window, File, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions,
     FileSystemWritableFileStream,
@@ -51,8 +51,9 @@ fn parse_js_error(msg: JsValue) -> Error {
     )
 }
 
-fn dyn_map_err<T: JsCast>(result: Result<JsValue, JsValue>) -> Result<T, Error> {
-    result.and_then(JsCast::dyn_into).map_err(parse_js_error)
+struct OPFSFile {
+    file: File,
+    handle: FileSystemFileHandle,
 }
 
 async fn get_handle_by_filename(filename: &str) -> Result<FileSystemFileHandle, Error> {
@@ -73,17 +74,43 @@ async fn get_handle_by_filename(filename: &str) -> Result<FileSystemFileHandle, 
         .map_err(parse_js_error)
 }
 
-#[derive(Default, Debug)]
-pub struct OpfsCore {}
-
-impl OpfsCore {
-    async fn store_file(&self, file_name: &str, content: &[u8]) -> Result<(), Error> {
-        let handle = get_handle_by_filename(file_name).await?;
-
-        let writable: FileSystemWritableFileStream = JsFuture::from(handle.create_writable())
+impl OPFSFile {
+    async fn from_filename(filename: &str) -> Result<Self> {
+        let handle = get_handle_by_filename(filename).await?;
+        Self::from_handle(handle).await
+    }
+    async fn from_handle(handle: FileSystemFileHandle) -> Result<Self> {
+        let file: File = JsFuture::from(handle.get_file())
             .await
             .and_then(JsCast::dyn_into)
             .map_err(parse_js_error)?;
+
+        Ok(Self { file, handle })
+    }
+    async fn read(&self, offset: u64, size: u64) -> Result<Uint8Array, Error> {
+        let blob = self
+            .file
+            .slice_with_f64_and_f64(offset as f64, (size + offset) as f64)
+            .map_err(parse_js_error)?;
+
+        let array_buffer = JsFuture::from(blob.array_buffer())
+            .await
+            .map_err(parse_js_error)?;
+        Ok(Uint8Array::new(&array_buffer))
+    }
+    async fn write(&self, content: &[u8], offset: u64) -> Result<(), Error> {
+        let writable: FileSystemWritableFileStream = JsFuture::from(self.handle.create_writable())
+            .await
+            .and_then(JsCast::dyn_into)
+            .map_err(parse_js_error)?;
+
+        JsFuture::from(
+            writable
+                .seek_with_f64(offset as f64)
+                .map_err(parse_js_error)?,
+        )
+        .await
+        .map_err(parse_js_error)?;
 
         // QuotaExceeded or NotAllowed
         JsFuture::from(
@@ -100,18 +127,10 @@ impl OpfsCore {
 
         Ok(())
     }
-
-    async fn read_file(&self, file_name: &str) -> Result<Vec<u8>, Error> {
-        let handle = get_handle_by_filename(file_name).await?;
-
-        let file: File = JsFuture::from(handle.get_file())
-            .await
-            .and_then(JsCast::dyn_into)
-            .map_err(parse_js_error)?;
-        let array_buffer = JsFuture::from(file.array_buffer())
-            .await
-            .map_err(parse_js_error)?;
-
-        Ok(js_sys::Uint8Array::new(&array_buffer).to_vec())
+    fn get_size(&self) -> u64 {
+        self.file.size() as u64
     }
 }
+
+#[derive(Default, Debug)]
+pub struct OpfsCore {}
